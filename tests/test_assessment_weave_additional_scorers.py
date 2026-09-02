@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import logging
 import sys
+from collections.abc import Callable
+from dataclasses import dataclass
 from types import ModuleType
 from typing import Any
 
@@ -42,10 +44,15 @@ class StubScorer(BaseScorer):
         )
 
 
+@dataclass
+class FakeWeaveRAIScorer:
+    rai_scorer: BaseScorer
+
+
 def _install_fake_weave_modules(
     monkeypatch: pytest.MonkeyPatch,
     *,
-    adapter: Any,
+    adapter: Callable[[BaseScorer], FakeWeaveRAIScorer],
     captured: dict[str, Any],
     expected_result: object,
 ) -> None:
@@ -63,9 +70,19 @@ def _install_fake_weave_modules(
             model: object,
             profile: object,
             dataset: object,
-            **kwargs: Any,
+            *,
+            name: str,
+            include_weave_builtins: bool,
+            additional_scorers: list[FakeWeaveRAIScorer],
         ) -> tuple[object, dict[str, Any]]:
-            captured.update(kwargs)
+            assert all(
+                isinstance(scorer, FakeWeaveRAIScorer) for scorer in additional_scorers
+            )
+            captured.update(
+                name=name,
+                include_weave_builtins=include_weave_builtins,
+                additional_scorers=additional_scorers,
+            )
             return object(), {}
 
     evaluation_module.WeaveEvaluationRunner = FakeWeaveEvaluationRunner  # type: ignore[attr-defined]
@@ -107,12 +124,14 @@ async def test_weave_evaluation_receives_adapted_additional_scorers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     scorer = StubScorer()
-    adapted_scorer = object()
+    adapted_scorer = FakeWeaveRAIScorer(scorer)
     captured: dict[str, Any] = {}
     expected_result = object()
     _install_fake_weave_modules(
         monkeypatch,
-        adapter=lambda value: adapted_scorer if value is scorer else None,
+        adapter=lambda value: (
+            adapted_scorer if value is scorer else FakeWeaveRAIScorer(value)
+        ),
         captured=captured,
         expected_result=expected_result,
     )
@@ -133,26 +152,26 @@ async def test_weave_evaluation_receives_adapted_additional_scorers(
 
 
 @pytest.mark.asyncio
-async def test_weave_evaluation_warns_and_keeps_adaptable_scorers(
+async def test_weave_evaluation_falls_back_to_core_pipeline_when_adaptation_fails(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     adaptable = StubScorer(name="adaptable")
     unsupported = StubScorer(name="unsupported")
-    adapted_scorer = object()
     captured: dict[str, Any] = {}
-    expected_result = object()
+    weave_result = object()
+    fallback_result = object()
 
-    def adapt(scorer: StubScorer) -> object:
+    def adapt(scorer: BaseScorer) -> FakeWeaveRAIScorer:
         if scorer is unsupported:
             raise TypeError("unsupported scorer")
-        return adapted_scorer
+        return FakeWeaveRAIScorer(scorer)
 
     _install_fake_weave_modules(
         monkeypatch,
         adapter=adapt,
         captured=captured,
-        expected_result=expected_result,
+        expected_result=weave_result,
     )
     assessor = Assessor(
         model=StubModel(),
@@ -163,9 +182,22 @@ async def test_weave_evaluation_warns_and_keeps_adaptable_scorers(
     monkeypatch.setattr(assessor, "_should_use_weave_evaluation", lambda: True)
     profile = assessor.engine.create_profile_from_preset("general")
 
+    async def run_core_evaluation(**kwargs: Any) -> object:
+        captured["core_kwargs"] = kwargs
+        return fallback_result
+
+    monkeypatch.setattr(assessor.pipeline, "run_evaluation", run_core_evaluation)
+
     with caplog.at_level(logging.WARNING):
         result = await assessor._run_evaluation(profile, [{"input": "hello"}])
 
-    assert result is expected_result
-    assert captured["additional_scorers"] == [adapted_scorer]
-    assert "Could not adapt additional scorer StubScorer for Weave" in caplog.text
+    assert result is fallback_result
+    assert captured["core_kwargs"]["model"] is assessor.model
+    assert captured["core_kwargs"]["profile"] is profile
+    assert captured["core_kwargs"]["dataset"] == [{"input": "hello"}]
+    assert assessor.pipeline.additional_scorers == [adaptable, unsupported]
+    assert "additional_scorers" not in captured
+    assert (
+        "Weave-native evaluation unavailable (unsupported scorer); using core pipeline."
+        in caplog.text
+    )

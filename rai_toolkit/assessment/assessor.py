@@ -533,15 +533,7 @@ class Assessor:
 
                 weave_additional_scorers = []
                 for scorer in self.additional_scorers:
-                    try:
-                        weave_additional_scorers.append(make_weave_rai_scorer(scorer))
-                    except Exception as e:  # noqa: BLE001 - keep valid scorers running
-                        logger.warning(
-                            "Could not adapt additional scorer %s for Weave; "
-                            "skipping it (%s).",
-                            type(scorer).__name__,
-                            e,
-                        )
+                    weave_additional_scorers.append(make_weave_rai_scorer(scorer))
 
                 weave_ds = _dataset_rows_for_weave(dataset)
                 weave_model = WeaveModel(rai_model=self.model, model_name=self.model.name)
