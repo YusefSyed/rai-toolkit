@@ -96,7 +96,7 @@ class LLMJudgeScorer(BaseScorer):
         base_url: str | None = None,
         temperature: float = 0.1,
         threshold: float = 0.5,
-        category: str = "",
+        category: str | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(category=category, threshold=threshold, **kwargs)
