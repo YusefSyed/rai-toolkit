@@ -520,11 +520,28 @@ class Assessor:
 
         if self._should_use_weave_evaluation():
             try:
-                from integrations.weave_integration.evaluation import WeaveEvaluationRunner
+                from integrations.weave_integration.evaluation import (
+                    WeaveEvaluationRunner,
+                )
+                from integrations.weave_integration.models import WeaveModel
+                from integrations.weave_integration.scorers import (
+                    make_weave_rai_scorer,
+                )
                 from rai_toolkit.evaluation.weave_adapter import (
                     weave_eval_results_to_evaluation_results,
                 )
-                from integrations.weave_integration.models import WeaveModel
+
+                weave_additional_scorers = []
+                for scorer in self.additional_scorers:
+                    try:
+                        weave_additional_scorers.append(make_weave_rai_scorer(scorer))
+                    except Exception as e:  # noqa: BLE001 - keep valid scorers running
+                        logger.warning(
+                            "Could not adapt additional scorer %s for Weave; "
+                            "skipping it (%s).",
+                            type(scorer).__name__,
+                            e,
+                        )
 
                 weave_ds = _dataset_rows_for_weave(dataset)
                 weave_model = WeaveModel(rai_model=self.model, model_name=self.model.name)
@@ -536,6 +553,7 @@ class Assessor:
                     weave_ds,
                     name=ev_name,
                     include_weave_builtins=self.include_weave_builtin_scorers,
+                    additional_scorers=weave_additional_scorers,
                 )
                 return weave_eval_results_to_evaluation_results(
                     self.pipeline,
