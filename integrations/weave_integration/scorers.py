@@ -109,7 +109,7 @@ class WeaveRAIScorer(weave.Scorer):
         call_display_name=lambda call: _wrapped_scorer_display_name(call),
         kind="scorer",
     )
-    def score(
+    async def score(
         self,
         output: dict[str, Any] | str,
         input_text: str = "",
@@ -159,7 +159,7 @@ class WeaveRAIScorer(weave.Scorer):
         if plain_rubrics is not None:
             optional_inputs["rubrics"] = plain_rubrics
 
-        result = self._rai_scorer.score(
+        result = await self._rai_scorer.score_async(
             output=output_text,
             input=input_text,
             context=effective_context,

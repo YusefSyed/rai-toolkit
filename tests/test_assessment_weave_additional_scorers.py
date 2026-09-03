@@ -44,6 +44,43 @@ class StubScorer(BaseScorer):
         )
 
 
+class AsyncContractScorer(BaseScorer):
+    def __init__(self) -> None:
+        super().__init__()
+        self.sync_calls = 0
+        self.async_calls = 0
+
+    def score(
+        self,
+        output: str,
+        input: str = "",
+        context: str = "",
+        **kwargs: Any,
+    ) -> ScorerResult:
+        self.sync_calls += 1
+        return ScorerResult(
+            score=0.0,
+            passed=False,
+            category="custom",
+            explanation="sync",
+        )
+
+    async def score_async(
+        self,
+        output: str,
+        input: str = "",
+        context: str = "",
+        **kwargs: Any,
+    ) -> ScorerResult:
+        self.async_calls += 1
+        return ScorerResult(
+            score=1.0,
+            passed=True,
+            category="custom",
+            explanation="async",
+        )
+
+
 @dataclass
 class FakeWeaveRAIScorer:
     rai_scorer: BaseScorer
@@ -201,3 +238,59 @@ async def test_weave_evaluation_falls_back_to_core_pipeline_when_adaptation_fail
         "Weave-native evaluation unavailable (unsupported scorer); using core pipeline."
         in caplog.text
     )
+
+
+@pytest.mark.asyncio
+async def test_real_weave_evaluation_awaits_async_additional_scorer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("weave")
+    from rai_toolkit.compliance.frameworks import ComplianceProfile, Framework
+
+    monkeypatch.setenv("WANDB_MODE", "offline")
+    monkeypatch.setenv("WANDB_SILENT", "true")
+
+    profile = ComplianceProfile(
+        name="empty",
+        framework=Framework.MIT_AI_RISK,
+        categories=[],
+    )
+    dataset = [{"input": "hello"}]
+
+    weave_scorer = AsyncContractScorer()
+    weave_assessor = Assessor(
+        model=StubModel(),
+        preset="general",
+        datasets=["unused"],
+        additional_scorers=[weave_scorer],
+        use_weave_evaluation=True,
+        include_weave_builtin_scorers=False,
+    )
+    weave_result = await weave_assessor._run_evaluation(profile, dataset)
+
+    core_scorer = AsyncContractScorer()
+    core_assessor = Assessor(
+        model=StubModel(),
+        preset="general",
+        datasets=["unused"],
+        additional_scorers=[core_scorer],
+        use_weave_evaluation=False,
+    )
+    core_result = await core_assessor._run_evaluation(profile, dataset)
+
+    scorer_name = "AsyncContractScorer"
+    assert weave_result.metadata["evaluation_backend"] == "weave"
+    assert weave_result.metadata["scorers_used"] == [scorer_name]
+    assert set(weave_result.items[0].scores) == {scorer_name}
+    assert set(core_result.items[0].scores) == {scorer_name}
+    weave_cell = weave_result.items[0].scores[scorer_name]
+    core_cell = core_result.items[0].scores[scorer_name]
+
+    assert weave_scorer.sync_calls == 0
+    assert weave_scorer.async_calls == 1
+    assert core_scorer.sync_calls == 0
+    assert core_scorer.async_calls == 1
+    assert weave_cell == core_cell
+    assert weave_cell.score == 1.0
+    assert weave_cell.passed is True
+    assert weave_cell.explanation == "async"
