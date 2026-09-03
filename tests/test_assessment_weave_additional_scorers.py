@@ -6,6 +6,8 @@ from __future__ import annotations
 
 import logging
 import sys
+import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from types import ModuleType
@@ -16,6 +18,7 @@ import pytest
 from rai_toolkit.assessment import Assessor
 from rai_toolkit.models.base import BaseModel, ModelResponse
 from rai_toolkit.scorers.base import BaseScorer, ScorerResult
+from rai_toolkit.scorers.llm_judges import LLMJudgeScorer
 
 
 class StubModel(BaseModel):
@@ -46,7 +49,7 @@ class StubScorer(BaseScorer):
 
 class AsyncContractScorer(BaseScorer):
     def __init__(self) -> None:
-        super().__init__()
+        super().__init__(name="async_contract")
         self.sync_calls = 0
         self.async_calls = 0
 
@@ -79,6 +82,62 @@ class AsyncContractScorer(BaseScorer):
             category="custom",
             explanation="async",
         )
+
+
+class BlockingSyncScorer(BaseScorer):
+    def __init__(self) -> None:
+        super().__init__(name="blocking_sync")
+        self._lock = threading.Lock()
+        self.active_calls = 0
+        self.max_active_calls = 0
+        self.total_calls = 0
+
+    def score(
+        self,
+        output: str,
+        input: str = "",
+        context: str = "",
+        **kwargs: Any,
+    ) -> ScorerResult:
+        with self._lock:
+            self.active_calls += 1
+            self.total_calls += 1
+            self.max_active_calls = max(self.max_active_calls, self.active_calls)
+        try:
+            time.sleep(0.05)
+        finally:
+            with self._lock:
+                self.active_calls -= 1
+        return ScorerResult(
+            score=1.0,
+            passed=True,
+            category="custom",
+            explanation="blocking sync",
+        )
+
+
+class BlockingLLMJudgeScorer(LLMJudgeScorer):
+    name = "blocking_llm_judge"
+    _judge_name = "FactualityJudge"
+
+    def __init__(self) -> None:
+        super().__init__(api_key="test")
+        self._lock = threading.Lock()
+        self.active_calls = 0
+        self.max_active_calls = 0
+        self.total_calls = 0
+
+    def _call_judge(self, system_prompt: str, user_prompt: str) -> dict[str, Any]:
+        with self._lock:
+            self.active_calls += 1
+            self.total_calls += 1
+            self.max_active_calls = max(self.max_active_calls, self.active_calls)
+        try:
+            time.sleep(0.05)
+        finally:
+            with self._lock:
+                self.active_calls -= 1
+        return {"score": 3, "explanation": "blocking llm judge"}
 
 
 @dataclass
@@ -278,7 +337,7 @@ async def test_real_weave_evaluation_awaits_async_additional_scorer(
     )
     core_result = await core_assessor._run_evaluation(profile, dataset)
 
-    scorer_name = "AsyncContractScorer"
+    scorer_name = "async_contract"
     assert weave_result.metadata["evaluation_backend"] == "weave"
     assert weave_result.metadata["scorers_used"] == [scorer_name]
     assert set(weave_result.items[0].scores) == {scorer_name}
@@ -294,3 +353,47 @@ async def test_real_weave_evaluation_awaits_async_additional_scorer(
     assert weave_cell.score == 1.0
     assert weave_cell.passed is True
     assert weave_cell.explanation == "async"
+
+
+@pytest.mark.asyncio
+async def test_real_weave_evaluation_keeps_sync_scorers_concurrent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pytest.importorskip("weave")
+    from rai_toolkit.compliance.frameworks import ComplianceProfile, Framework
+
+    monkeypatch.setenv("WANDB_MODE", "offline")
+    monkeypatch.setenv("WANDB_SILENT", "true")
+
+    profile = ComplianceProfile(
+        name="empty",
+        framework=Framework.MIT_AI_RISK,
+        categories=[],
+    )
+    dataset = [{"input": f"hello {index}"} for index in range(12)]
+    sync_scorer = BlockingSyncScorer()
+    llm_scorer = BlockingLLMJudgeScorer()
+    assessor = Assessor(
+        model=StubModel(),
+        preset="general",
+        datasets=["unused"],
+        additional_scorers=[sync_scorer, llm_scorer],
+        use_weave_evaluation=True,
+        include_weave_builtin_scorers=False,
+    )
+
+    result = await assessor._run_evaluation(profile, dataset)
+
+    scorer_names = {"blocking_sync", "blocking_llm_judge"}
+    assert result.metadata["evaluation_backend"] == "weave"
+    assert set(result.metadata["scorers_used"]) == scorer_names
+    assert len(result.items) == len(dataset)
+    for item in result.items:
+        assert set(item.scores) == scorer_names
+        assert all(cell.score == 1.0 for cell in item.scores.values())
+        assert all(cell.passed for cell in item.scores.values())
+
+    for scorer in (sync_scorer, llm_scorer):
+        assert scorer.total_calls == len(dataset)
+        assert scorer.active_calls == 0
+        assert scorer.max_active_calls > 1
