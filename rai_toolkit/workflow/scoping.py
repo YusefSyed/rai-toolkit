@@ -21,6 +21,7 @@ from pathlib import Path
 from rai_toolkit.assessment import Assessor
 from rai_toolkit.examples import DEMO_EXAMPLE_BUNDLES
 from rai_toolkit.models.base import BaseModel
+from rai_toolkit.policies.engine import PolicyEngine, load_policy_set
 from rai_toolkit.workflow.profile import (
     ApplicationProfile,
     DeploymentContext,
@@ -91,12 +92,63 @@ _DATASET_LIMIT: dict[RiskTier, int | None] = {
     RiskTier.CRITICAL: None,  # full dataset
 }
 
+# These policies apply to every built-in industry preset. Domain-specific
+# additions stay explicit here until first-class policy-pack loading lands.
+_COMMON_BUILTIN_POLICY_FILENAMES = (
+    "eu_ai_act_article_15.yaml",
+    "fairness_baseline.yaml",
+)
+_HEALTHCARE_POLICY_FILENAMES = ("healthcare_hipaa.yaml",)
+
 
 def _resolve_policies_dir(policies_dir: str | Path | None) -> str | None:
     if policies_dir is not None:
         return str(policies_dir)
-    default = Path(__file__).resolve().parents[1] / "policies" / "examples"
-    return str(default) if default.exists() else None
+    return str(_builtin_policy_directory())
+
+
+def _builtin_policy_directory() -> Path:
+    """Return the packaged directory containing built-in policy files."""
+    return Path(__file__).resolve().parents[1] / "policies" / "examples"
+
+
+def _builtin_policy_files(industry: Industry) -> list[Path]:
+    """Return the built-in policy files selected for one industry preset.
+
+    Built-ins are fail-closed: a missing directory, an unclassified YAML file,
+    or a duplicate selection is a packaging/registry error rather than a reason
+    to silently run a reduced policy set.
+    """
+    directory = _builtin_policy_directory()
+    if not directory.is_dir():
+        raise FileNotFoundError(
+            f"Built-in policy directory is missing: {directory}. "
+            "Pass policies_dir explicitly to use a user-supplied policy directory."
+        )
+
+    filenames = list(_COMMON_BUILTIN_POLICY_FILENAMES)
+    if industry is Industry.HEALTHCARE:
+        filenames.extend(_HEALTHCARE_POLICY_FILENAMES)
+
+    if len(filenames) != len(set(filenames)):
+        raise ValueError("Built-in policy registry selects a filename more than once.")
+
+    classified = set(_COMMON_BUILTIN_POLICY_FILENAMES) | set(
+        _HEALTHCARE_POLICY_FILENAMES
+    )
+    available = {path.name for path in directory.glob("*.yaml")}
+    unclassified = sorted(available - classified)
+    if unclassified:
+        raise ValueError(
+            "Built-in policy registry does not classify: " + ", ".join(unclassified)
+        )
+
+    missing = sorted(classified - available)
+    if missing:
+        raise FileNotFoundError(
+            "Built-in policy registry references missing file(s): " + ", ".join(missing)
+        )
+    return [directory / filename for filename in filenames]
 
 
 def _effective_risk_tier(
@@ -216,8 +268,22 @@ def scope_assessor(
     )
 
     resolved_policies = _resolve_policies_dir(policies_dir)
-    if resolved_policies:
-        rationale.append(f"Policies loaded from `{resolved_policies}`.")
+    policies_engine: PolicyEngine | None = None
+    if policies_dir is not None:
+        # A caller-selected directory is a complete override: its files are
+        # loaded exactly as supplied, without mixing in or filtering built-ins.
+        if resolved_policies:
+            rationale.append(
+                f"Policies loaded from user-supplied `{resolved_policies}`."
+            )
+    else:
+        policy_files = _builtin_policy_files(profile.industry)
+        policies_engine = PolicyEngine([load_policy_set(path) for path in policy_files])
+        rationale.append(
+            "Built-in policy files selected: "
+            + ", ".join(f"`{path.name}`" for path in policy_files)
+            + "."
+        )
 
     if profile.weave_project:
         rationale.append(
@@ -230,7 +296,8 @@ def scope_assessor(
         model=model,
         preset=preset,
         datasets=datasets,
-        policies_dir=resolved_policies,
+        policies_dir=resolved_policies if policies_dir is not None else None,
+        policies_engine=policies_engine,
         run_redteam=run_redteam,
         redteam_max_severity=severity_cap,
         extra_redteam_sources=list(profile.extra_redteam_sources),
