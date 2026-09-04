@@ -18,6 +18,7 @@ import pytest
 from rai_toolkit.assessment import Assessor
 from rai_toolkit.models.base import BaseModel, ModelResponse
 from rai_toolkit.scorers.base import BaseScorer, ScorerResult
+from rai_toolkit.scorers.composite import CompositeScorer
 from rai_toolkit.scorers.llm_judges import LLMJudgeScorer
 
 
@@ -356,8 +357,10 @@ async def test_real_weave_evaluation_awaits_async_additional_scorer(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("composite", [False, True])
 async def test_real_weave_evaluation_keeps_sync_scorers_concurrent(
     monkeypatch: pytest.MonkeyPatch,
+    composite: bool,
 ) -> None:
     pytest.importorskip("weave")
     from rai_toolkit.compliance.frameworks import ComplianceProfile, Framework
@@ -377,14 +380,20 @@ async def test_real_weave_evaluation_keeps_sync_scorers_concurrent(
         model=StubModel(),
         preset="general",
         datasets=["unused"],
-        additional_scorers=[sync_scorer, llm_scorer],
+        additional_scorers=(
+            [CompositeScorer([sync_scorer, llm_scorer], name="composite")]
+            if composite
+            else [sync_scorer, llm_scorer]
+        ),
         use_weave_evaluation=True,
         include_weave_builtin_scorers=False,
     )
 
     result = await assessor._run_evaluation(profile, dataset)
 
-    scorer_names = {"blocking_sync", "blocking_llm_judge"}
+    scorer_names = (
+        {"composite"} if composite else {"blocking_sync", "blocking_llm_judge"}
+    )
     assert result.metadata["evaluation_backend"] == "weave"
     assert set(result.metadata["scorers_used"]) == scorer_names
     assert len(result.items) == len(dataset)

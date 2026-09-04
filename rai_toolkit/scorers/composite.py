@@ -6,9 +6,11 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from rai_toolkit.scorers.base import BaseScorer, ScorerResult
+from rai_toolkit.scorers.llm_judges import LLMJudgeScorer
 from rai_toolkit.scorers.normalizer import ScoreNormalizer
 
 
@@ -78,14 +80,23 @@ class CompositeScorer(BaseScorer):
         """Asynchronously score each child before combining its result.
 
         Child scorers run sequentially to preserve the composite's existing
-        execution behaviour; a child can override ``score_async`` for its own
-        asynchronous implementation.
+        execution behaviour. Sync-delegating children run in a worker thread;
+        genuine asynchronous overrides are awaited directly.
         """
         results = []
         for scorer in self.scorers:
-            result = await scorer.score_async(
-                output=output, input=input, context=context, **kwargs
-            )
+            # Match the Weave adapter's handling of the bundled sync delegates.
+            if type(scorer).score_async in {
+                BaseScorer.score_async,
+                LLMJudgeScorer.score_async,
+            }:
+                result = await asyncio.to_thread(
+                    scorer.score, output=output, input=input, context=context, **kwargs
+                )
+            else:
+                result = await scorer.score_async(
+                    output=output, input=input, context=context, **kwargs
+                )
             results.append(result)
 
         return self._combine_results(results)

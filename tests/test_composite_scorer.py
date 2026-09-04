@@ -4,6 +4,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
+from contextvars import ContextVar
 from typing import Any
 
 import pytest
@@ -137,3 +140,52 @@ def test_sync_all_unassessed_results_preserve_coverage_details() -> None:
     assert result.details["scorers_passed"] == 0
     assert result.details["scorers_failed"] == 0
     assert all(not child["assessed"] for child in result.details["individual_results"])
+
+
+@pytest.mark.asyncio
+async def test_async_children_preserve_order_context_and_execution_thread() -> None:
+    caller_thread = threading.get_ident()
+    trace = ContextVar("trace", default="missing")
+    calls: list[tuple[str, int, str]] = []
+
+    class SyncChild(FakeScorer):
+        def score(self, **kwargs: Any) -> ScorerResult:
+            calls.append((self.name, threading.get_ident(), trace.get()))
+            return super().score(**kwargs)
+
+    class AsyncChild(AsyncOnlyScorer):
+        async def score_async(self, **kwargs: Any) -> ScorerResult:
+            await asyncio.sleep(0)
+            calls.append((self.name, threading.get_ident(), trace.get()))
+            return await super().score_async(**kwargs)
+
+    scorers = [
+        SyncChild(_result(1.0, "first"), "first"),
+        AsyncChild(_result(1.0, "second"), "second"),
+        SyncChild(_result(1.0, "third"), "third"),
+    ]
+    token = trace.set("row-context")
+    try:
+        result = await CompositeScorer(scorers).score_async("output")
+    finally:
+        trace.reset(token)
+
+    assert [name for name, _, _ in calls] == ["first", "second", "third"]
+    assert [value for _, _, value in calls] == ["row-context"] * 3
+    assert calls[0][1] != caller_thread
+    assert calls[1][1] == caller_thread
+    assert calls[2][1] != caller_thread
+    assert result.passed
+
+
+@pytest.mark.asyncio
+async def test_async_sync_child_error_stops_later_children() -> None:
+    class FailingChild(FakeScorer):
+        def score(self, **kwargs: Any) -> ScorerResult:
+            raise ValueError("child failed")
+
+    failing = FailingChild(_result(1.0, "first"), "first")
+    later = FakeScorer(_result(1.0, "second"), "second")
+    with pytest.raises(ValueError, match="child failed"):
+        await CompositeScorer([failing, later]).score_async("output")
+    assert later.sync_calls == 0
